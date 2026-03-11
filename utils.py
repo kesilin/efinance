@@ -145,9 +145,11 @@ def save_history(fund_code, fund_name, latest_nav, nav_date):
     """保存分析记录到历史文件"""
     history_path = "data/history.csv"
     df = pd.read_csv(history_path, encoding="utf-8-sig")
+    # 确保基金代码为字符串格式（6位无前缀）
+    fund_code = str(fund_code).zfill(6)
     # 已存在的记录更新，不存在新增
-    if fund_code in df['基金代码'].values:
-        df.loc[df['基金代码'] == fund_code, ["基金名称", "最新净值", "最新分析时间", "净值更新日期"]] = [
+    if fund_code in df['基金代码'].astype(str).str.zfill(6).values:
+        df.loc[df['基金代码'].astype(str).str.zfill(6) == fund_code, ["基金名称", "最新净值", "最新分析时间", "净值更新日期"]] = [
             fund_name, latest_nav, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), nav_date
         ]
     else:
@@ -161,14 +163,32 @@ def save_history(fund_code, fund_name, latest_nav, nav_date):
         df = pd.concat([df, new_row], ignore_index=True)
     df.to_csv(history_path, index=False, encoding="utf-8-sig")
 
-def load_history():
-    """加载历史分析记录"""
+def load_history(deduplicate=True):
+    """加载历史分析记录
+    
+    Args:
+        deduplicate: 是否按基金代码去重，保留最新的记录
+    
+    Returns:
+        pd.DataFrame: 历史记录表
+    """
     history_path = "data/history.csv"
-    return pd.read_csv(history_path, encoding="utf-8-sig")
+    df = pd.read_csv(history_path, encoding="utf-8-sig")
+    if not df.empty:
+        # 确保基金代码为字符串格式（6位无前缀）
+        df['基金代码'] = df['基金代码'].astype(str).str.zfill(6)
+        if deduplicate:
+            # 按基金代码分组，保留最新分析时间的记录
+            df['最新分析时间'] = pd.to_datetime(df['最新分析时间'], errors='coerce')
+            df = df.sort_values('最新分析时间', ascending=False).drop_duplicates('基金代码', keep='first')
+            df = df.sort_values('最新分析时间', ascending=False).reset_index(drop=True)
+    return df
 
 def delete_history(fund_code):
     """删除历史记录"""
     history_path = "data/history.csv"
     df = pd.read_csv(history_path, encoding="utf-8-sig")
-    df = df[df['基金代码'] != fund_code]
+    # 确保基金代码为字符串格式
+    fund_code = str(fund_code).zfill(6)
+    df = df[df['基金代码'].astype(str).str.zfill(6) != fund_code]
     df.to_csv(history_path, index=False, encoding="utf-8-sig")

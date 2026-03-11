@@ -470,6 +470,21 @@ def gemini_preflight_check(api_key, model_name):
         return False, f"Gemini预检异常：{e}"
 
 
+def do_gemini_preflight_with_ui(api_key, model_name, progress_hint, hint_placeholder_empty=True):
+    """执行Gemini预检并显示UI提示，返回是否通过"""
+    if progress_hint:
+        progress_hint.info("Gemini连通性预检中...")
+    ok, msg = gemini_preflight_check(api_key.strip(), model_name.strip())
+    if not ok:
+        if progress_hint:
+            progress_hint.empty()
+        return False
+    if progress_hint:
+        progress_hint.success(msg)
+    return True
+
+
+
 def detect_network_context():
     """Best-effort network context detection for Gemini compliance reminder."""
     context = {
@@ -693,6 +708,309 @@ def run_investment_decision(provider, api_key, model_name, api_base, analysis, p
         api_base=api_base,
     )
 
+
+def _extract_json_block(text):
+    src = str(text or "").strip()
+    if not src:
+        return ""
+    fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*\}|\[[\s\S]*\])\s*```", src, re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    brace_obj = re.search(r"(\{[\s\S]*\})", src)
+    if brace_obj:
+        return brace_obj.group(1).strip()
+    brace_arr = re.search(r"(\[[\s\S]*\])", src)
+    if brace_arr:
+        return brace_arr.group(1).strip()
+    return src
+
+
+def parse_positions_from_text_with_gemini(raw_text, api_key, model_name):
+    prompt = (
+        "你是基金持仓结构化提取助手。请把用户文本中的持仓/申购信息提取为JSON。\n"
+        "只输出JSON，不要解释。\n"
+        "输出格式：\n"
+        "{\n"
+        "  \"as_of_date\": \"YYYY-MM-DD 或空\",\n"
+        "  \"items\": [\n"
+        "    {\n"
+        "      \"fund_code\": \"6位字符串\",\n"
+        "      \"fund_name\": \"基金名称\",\n"
+        "      \"hold_cost\": 数值或null,\n"
+        "      \"hold_share\": 数值或null,\n"
+        "      \"subscribe_amount\": 数值或null,\n"
+        "      \"buy_date\": \"YYYY-MM-DD 或空\",\n"
+        "      \"notes\": \"备注\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "规则：\n"
+        "1) fund_code必须保留前导0；\n"
+        "2) 若文本提供了持仓成本和持仓份额，写入hold_cost/hold_share；\n"
+        "3) 若只有申购金额，写入subscribe_amount；\n"
+        "4) 无法确定字段填null，不要编造。\n\n"
+        f"【用户文本】\n{raw_text}"
+    )
+    text, used_model = call_gemini_with_retry(prompt, api_key=api_key, model_name=model_name, zh_only=True)
+    terminal_log("Position parse done", model=used_model, text_len=len(text))
+    json_text = _extract_json_block(text)
+    data = json.loads(json_text)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    as_of_date = data.get("as_of_date", "") if isinstance(data, dict) else ""
+    return as_of_date, items
+
+
+def _safe_float(v):
+    if v is None:
+        return None
+    s = str(v).replace(",", "").replace("%", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _safe_buy_date(v):
+    s = str(v or "").strip()
+    if not s:
+        return datetime.now().strftime("%Y-%m-%d")
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def calc_fee_free_redeem_date(buy_date_text):
+    s = str(buy_date_text or "").strip()
+    if not s:
+        return "无数据"
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return (dt + timedelta(days=7)).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return "无数据"
+
+
+def _as_trade_date_from_text(text, fallback_date=""):
+    src = str(text or "").strip()
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", src)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"(\d{4}/\d{2}/\d{2})", src)
+    if m2:
+        return m2.group(1).replace("/", "-")
+    return fallback_date or datetime.now().strftime("%Y-%m-%d")
+
+
+def _normalize_position_row_values(cost, share, subscribe_amount, latest_nav):
+    # 纠偏：把“金额/净值”错位的行自动修正
+    if cost is not None and subscribe_amount is not None:
+        if cost > 50 and 0 < subscribe_amount < 20:
+            cost, subscribe_amount = subscribe_amount, cost
+
+    # 纠偏：老数据只有成本与份额时，若成本明显像金额（如500）则视作申购金额
+    if subscribe_amount is None and cost is not None and cost > 50 and latest_nav is not None and latest_nav > 0:
+        subscribe_amount = float(cost)
+        cost = float(latest_nav)
+        if share is None or share <= 0:
+            share = subscribe_amount / latest_nav
+
+    if (share is None or share <= 0) and subscribe_amount is not None and subscribe_amount > 0 and cost is not None and cost > 0:
+        share = subscribe_amount / cost
+
+    if cost is not None and cost > 50 and subscribe_amount is not None and subscribe_amount > 0 and latest_nav is not None and latest_nav > 0:
+        cost = float(latest_nav)
+        if share is None or share <= 0:
+            share = subscribe_amount / latest_nav
+
+    return cost, share, subscribe_amount
+
+
+def _calc_profit_fields(latest_nav, cost, share, subscribe_amount):
+    if latest_nav is None or share is None or share <= 0:
+        return None, None, None, None
+    market_value = float(latest_nav) * float(share)
+    if subscribe_amount is not None and subscribe_amount > 0:
+        principal = float(subscribe_amount)
+    elif cost is not None and cost > 0:
+        principal = float(cost) * float(share)
+    else:
+        principal = None
+    if principal is None or principal <= 0:
+        return market_value, None, None, principal
+    profit = market_value - principal
+    profit_rate = (profit / principal) * 100
+    return market_value, profit, profit_rate, principal
+
+
+def merge_position_editor_changes(base_df, edited_df):
+    merged_df = ensure_position_columns(base_df.copy())
+    new_edit = edited_df.copy()
+    if "基金代码" not in new_edit.columns:
+        return merged_df
+    new_edit["基金代码"] = new_edit["基金代码"].astype(str).str.zfill(6)
+
+    for _idx, row in new_edit.iterrows():
+        code = str(row.get("基金代码", "")).strip().zfill(6)
+        if not code.isdigit() or len(code) != 6:
+            continue
+        if code in merged_df["基金代码"].astype(str).str.zfill(6).values:
+            mask = merged_df["基金代码"].astype(str).str.zfill(6) == code
+            for col in ["基金名称", "持仓成本", "持仓份额", "申购金额", "买入日期", "备注"]:
+                if col in new_edit.columns and col in merged_df.columns:
+                    merged_df.loc[mask, col] = row.get(col)
+        else:
+            new_row = {c: np.nan for c in merged_df.columns}
+            for col in ["基金代码", "基金名称", "持仓成本", "持仓份额", "申购金额", "买入日期", "备注"]:
+                if col in merged_df.columns:
+                    new_row[col] = row.get(col)
+            merged_df = pd.concat([merged_df, pd.DataFrame([new_row])], ignore_index=True)
+
+    return merged_df
+
+
+def upsert_positions_from_ai_items(position_df, items, overwrite_existing=False):
+    updated = ensure_position_columns(position_df.copy())
+    inserted_count = 0
+    for item in items:
+        fund_code = str(item.get("fund_code", "")).strip().zfill(6)
+        if not fund_code.isdigit() or len(fund_code) != 6:
+            continue
+
+        analyzer = UniversalFundAnalyzer(fund_code)
+        fund_name = analyzer.fund_name
+        latest_nav = analyzer.history_nav['单位净值'].iloc[-1] if not analyzer.history_nav.empty else None
+        if latest_nav is None:
+            continue
+
+        hold_cost = _safe_float(item.get("hold_cost"))
+        hold_share = _safe_float(item.get("hold_share"))
+        subscribe_amount = _safe_float(item.get("subscribe_amount"))
+        notes = str(item.get("notes", "") or "").strip()
+
+        if hold_cost is not None and hold_share is not None and hold_share > 0:
+            cost = float(hold_cost)
+            share = float(hold_share)
+            subscribe_val = np.nan
+        elif subscribe_amount is not None and subscribe_amount > 0:
+            cost = float(latest_nav)
+            share = float(subscribe_amount) / float(latest_nav) if latest_nav else 0
+            subscribe_val = float(subscribe_amount)
+        else:
+            continue
+
+        if share <= 0:
+            continue
+
+        buy_date = _safe_buy_date(item.get("buy_date"))
+        _mv, profit, profit_rate, _p = _calc_profit_fields(latest_nav, cost, share, subscribe_val)
+        if profit is None:
+            profit = 0
+        if profit_rate is None:
+            profit_rate = 0
+
+        if fund_code in updated['基金代码'].astype(str).str.zfill(6).values:
+            if not overwrite_existing:
+                continue
+            updated.loc[updated['基金代码'].astype(str).str.zfill(6) == fund_code, [
+                "基金名称", "持仓成本", "持仓份额", "申购金额", "买入日期", "备注", "最新净值", "浮盈浮亏", "浮盈浮亏比例"
+            ]] = [
+                fund_name, cost, share, subscribe_val, buy_date, notes, latest_nav, profit, profit_rate
+            ]
+        else:
+            new_row = pd.DataFrame([{
+                "基金代码": fund_code,
+                "基金名称": fund_name,
+                "持仓成本": cost,
+                "持仓份额": share,
+                "申购金额": subscribe_val,
+                "买入日期": buy_date,
+                "备注": notes,
+                "最新净值": latest_nav,
+                "浮盈浮亏": profit,
+                "浮盈浮亏比例": profit_rate,
+            }])
+            updated = pd.concat([updated, new_row], ignore_index=True)
+        inserted_count += 1
+
+    return updated, inserted_count
+
+
+def ensure_position_columns(position_df):
+    alias_map = {
+        "fund_code": "基金代码",
+        "fund_name": "基金名称",
+        "hold_cost": "持仓成本",
+        "hold_share": "持仓份额",
+        "hold_shares": "持仓份额",
+        "subscribe_amount": "申购金额",
+        "buy_date": "买入日期",
+        "notes": "备注",
+    }
+    for en_col, zh_col in alias_map.items():
+        if en_col in position_df.columns and zh_col not in position_df.columns:
+            position_df[zh_col] = position_df[en_col]
+
+    required_cols = [
+        "基金代码", "基金名称", "持仓成本", "持仓份额", "买入日期", "最新净值", "浮盈浮亏", "浮盈浮亏比例"
+    ]
+    for col in required_cols:
+        if col not in position_df.columns:
+            position_df[col] = np.nan
+    if "申购金额" not in position_df.columns:
+        position_df["申购金额"] = np.nan
+    if "备注" not in position_df.columns:
+        position_df["备注"] = ""
+    if "当日涨跌幅" not in position_df.columns:
+        position_df["当日涨跌幅"] = np.nan
+    if "当日涨跌日期" not in position_df.columns:
+        position_df["当日涨跌日期"] = ""
+    return position_df
+
+
+def refresh_positions_with_latest(position_df, target_fund_code=None):
+    updated_df = ensure_position_columns(position_df.copy())
+    update_count = 0
+    for idx, row in updated_df.iterrows():
+        fund_code = str(row.get('基金代码', '')).strip().zfill(6)
+        if not fund_code.isdigit() or len(fund_code) != 6:
+            continue
+        if target_fund_code and fund_code != str(target_fund_code).strip().zfill(6):
+            continue
+        try:
+            analyzer = UniversalFundAnalyzer(fund_code)
+            latest_nav = analyzer.history_nav['单位净值'].iloc[-1] if not analyzer.history_nav.empty else None
+            if latest_nav is None:
+                continue
+
+            cost = _safe_float(row.get('持仓成本'))
+            share = _safe_float(row.get('持仓份额'))
+            subscribe_amount = _safe_float(row.get('申购金额'))
+            cost, share, subscribe_amount = _normalize_position_row_values(cost, share, subscribe_amount, latest_nav)
+
+            _mv, profit, profit_rate, _principal = _calc_profit_fields(latest_nav, cost, share, subscribe_amount)
+            updated_df.loc[idx, ["持仓成本", "持仓份额", "申购金额", "最新净值"]] = [cost, share, subscribe_amount, latest_nav]
+            if profit is not None and profit_rate is not None:
+                updated_df.loc[idx, ["浮盈浮亏", "浮盈浮亏比例"]] = [profit, profit_rate]
+
+            day_change = parse_change_value(analyzer.gsz)
+            fallback_trade_date = analyzer.history_nav['日期'].iloc[-1].strftime('%Y-%m-%d') if not analyzer.history_nav.empty else datetime.now().strftime("%Y-%m-%d")
+            day_change_time = _as_trade_date_from_text(analyzer.gsz_time, fallback_date=fallback_trade_date)
+            updated_df.loc[idx, ["当日涨跌幅"]] = [day_change if day_change is not None else np.nan]
+            updated_df.loc[idx, ["当日涨跌日期"]] = [day_change_time]
+            update_count += 1
+        except Exception as exc:
+            terminal_log("Position refresh failed", fund_code=fund_code, error=repr(exc)[:180])
+            continue
+
+    return updated_df, update_count
+
 # ========== Streamlit页面全局配置 ==========
 st.set_page_config(
     page_title="基金波段分析系统",
@@ -720,24 +1038,38 @@ st.markdown("""
     }
     .main .block-container {
         max-width: 95rem;
-        padding-top: 0.8rem;
+        padding-top: 0.35rem;
         padding-left: 1.2rem;
         padding-right: 1.2rem;
     }
+    .stApp [data-testid="stHeader"] {
+        height: 0.2rem;
+    }
+    .stApp [data-testid="stToolbar"] {
+        top: 0.15rem;
+    }
     .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
+        gap: 10px;
+        padding-top: 0.15rem;
+        border-bottom: 1px solid #2E364A;
     }
     .stTabs [data-baseweb="tab"] {
-        height: 50px;
+        height: 44px;
         white-space: pre-wrap;
         background-color: var(--bg-panel);
-        border-radius: 4px 4px 0px 0px;
+        border: 1px solid #2E364A;
+        border-bottom: none;
+        border-radius: 8px 8px 0px 0px;
         gap: 1px;
-        padding-top: 10px;
-        padding-bottom: 10px;
+        padding-top: 7px;
+        padding-bottom: 7px;
+        padding-left: 14px;
+        padding-right: 14px;
+        font-weight: 600;
     }
     .stTabs [aria-selected="true"] {
-        background-color: var(--bg-panel-2);
+        background-color: #29334B;
+        border-color: #3C4C6D;
     }
     div[data-testid="stMetricValue"] {
         font-size: 24px;
@@ -784,10 +1116,15 @@ st.markdown("""
         margin-top: 2px;
     }
     section[data-testid="stSidebar"] > div {
-        padding-top: 0.2rem;
+        padding-top: 0rem;
     }
     section[data-testid="stSidebar"] .block-container {
-        padding-top: 0.1rem;
+        padding-top: 0rem;
+        margin-top: -0.35rem;
+    }
+    section[data-testid="stSidebar"] [data-testid="stButton"] {
+        margin-top: 0.05rem;
+        margin-bottom: 0.45rem;
     }
     section[data-testid="stSidebar"] .feature-nav a {
         color: #c8d2e2;
@@ -801,6 +1138,31 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+if st.sidebar.button("⏹ 安全关闭程序", use_container_width=True, key="safe_shutdown_btn"):
+    try:
+        init_data_folder()
+        position_path_shutdown = "data/position.csv"
+        snapshot = st.session_state.get("position_editor_snapshot")
+        if isinstance(snapshot, pd.DataFrame):
+            if os.path.exists(position_path_shutdown):
+                base_df_shutdown = pd.read_csv(position_path_shutdown, encoding="utf-8-sig")
+            else:
+                base_df_shutdown = pd.DataFrame()
+            base_df_shutdown = ensure_position_columns(base_df_shutdown)
+            merged_shutdown = merge_position_editor_changes(base_df_shutdown, snapshot)
+            merged_shutdown, _ = refresh_positions_with_latest(merged_shutdown)
+            merged_shutdown.to_csv(position_path_shutdown, index=False, encoding="utf-8-sig")
+        elif os.path.exists(position_path_shutdown):
+            base_df_shutdown = pd.read_csv(position_path_shutdown, encoding="utf-8-sig")
+            base_df_shutdown = ensure_position_columns(base_df_shutdown)
+            base_df_shutdown.to_csv(position_path_shutdown, index=False, encoding="utf-8-sig")
+
+        st.sidebar.success("已完成保存检查，程序正在关闭...")
+        time.sleep(0.4)
+        os._exit(0)
+    except Exception as shutdown_err:
+        st.sidebar.error(f"关闭失败：{shutdown_err}")
 
 st.sidebar.markdown("### 功能目录")
 st.sidebar.caption("轻量导航")
@@ -834,14 +1196,57 @@ st.sidebar.checkbox("出口未知时允许继续", value=st.session_state.get("n
 st.sidebar.number_input("连接超时(秒)", min_value=3, max_value=30, value=int(st.session_state.get("net_connect_timeout", 6)), key="net_connect_timeout")
 st.sidebar.number_input("读取超时(秒)", min_value=8, max_value=120, value=int(st.session_state.get("net_read_timeout", 25)), key="net_read_timeout")
 with st.sidebar.expander("⚙️ Gemini调参", expanded=False):
-    st.caption("这些参数会实时作用于Gemini请求")
-    st.slider("Temperature", min_value=0.0, max_value=1.0, value=float(st.session_state.get("gemini_temperature", 0.25)), step=0.05, key="gemini_temperature")
-    st.slider("Top P", min_value=0.1, max_value=1.0, value=float(st.session_state.get("gemini_top_p", 0.9)), step=0.05, key="gemini_top_p")
-    st.slider("Top K", min_value=1, max_value=80, value=int(st.session_state.get("gemini_top_k", 40)), step=1, key="gemini_top_k")
-    st.slider("最大输出Tokens", min_value=512, max_value=8192, value=int(st.session_state.get("gemini_max_output_tokens", 4096)), step=256, key="gemini_max_output_tokens")
-    st.slider("回退模型尝试数", min_value=1, max_value=6, value=int(st.session_state.get("gemini_max_retry_models", 5)), step=1, key="gemini_max_retry_models")
-    st.slider("结果最小字数", min_value=120, max_value=800, value=int(st.session_state.get("gemini_rewrite_min_chars", 280)), step=20, key="gemini_rewrite_min_chars")
-    st.slider("结果字号(px)", min_value=12, max_value=28, value=int(st.session_state.get("ui_output_font_px", 16)), step=1, key="ui_output_font_px")
+    st.caption("💡 拖动滑块调整或直接输入新值")
+    
+    # Temperature
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("Temperature", min_value=0.0, max_value=1.0, value=float(st.session_state.get("gemini_temperature", 0.25)), step=0.05, key="gemini_temperature")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_temperature', 0.25):.2f}")
+    
+    # Top P
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("Top P", min_value=0.1, max_value=1.0, value=float(st.session_state.get("gemini_top_p", 0.9)), step=0.05, key="gemini_top_p")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_top_p', 0.9):.2f}")
+    
+    # Top K
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("Top K", min_value=1, max_value=80, value=int(st.session_state.get("gemini_top_k", 40)), step=1, key="gemini_top_k")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_top_k', 40)}")
+    
+    # 最大输出Tokens (max 提高到 16384)
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("最大输出Tokens", min_value=512, max_value=16384, value=int(st.session_state.get("gemini_max_output_tokens", 4096)), step=512, key="gemini_max_output_tokens")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_max_output_tokens', 4096)}")
+    
+    # 回退模型尝试数
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("回退模型尝试数", min_value=1, max_value=6, value=int(st.session_state.get("gemini_max_retry_models", 5)), step=1, key="gemini_max_retry_models")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_max_retry_models', 5)}")
+    
+    # 结果最小字数 (max 提高到 2000)
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("结果最小字数", min_value=120, max_value=2000, value=int(st.session_state.get("gemini_rewrite_min_chars", 280)), step=20, key="gemini_rewrite_min_chars")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('gemini_rewrite_min_chars', 280)}")
+    
+    # 结果字号(px)
+    col1, col2 = st.columns([3.5, 1.5])
+    with col1:
+        st.slider("结果字号(px)", min_value=12, max_value=32, value=int(st.session_state.get("ui_output_font_px", 16)), step=1, key="ui_output_font_px")
+    with col2:
+        st.caption(f"当前: {st.session_state.get('ui_output_font_px', 16)}px")
+    
     st.text_area(
         "附加系统指令(可选)",
         value=st.session_state.get("gemini_extra_instruction", ""),
@@ -1156,30 +1561,23 @@ with _tabs[0]:
 
         refine_btn = st.button("✨ 调用API改写提示词", use_container_width=True)
         if refine_btn:
-            progress_hint = st.empty()
-            preflight_ok = True
             if not api_key.strip():
                 st.error("请先填写API Key")
             elif not user_requirement.strip():
                 st.error("请先填写补充策略要求")
+            elif not model_name.strip():
+                st.error("请先选择或填写模型名")
             else:
+                progress_hint = st.empty()
+                preflight_ok = True
                 if provider == "Gemini":
-                    progress_hint.info("步骤1/2：正在进行Gemini连通性预检...")
-                    ok, msg = gemini_preflight_check(api_key.strip(), model_name.strip())
-                    if not ok:
-                        preflight_ok = False
-                        st.error(msg)
-                        progress_hint.empty()
-                    else:
-                        progress_hint.success(msg)
+                    preflight_ok = do_gemini_preflight_with_ui(api_key.strip(), model_name.strip(), progress_hint)
+                    if not preflight_ok:
+                        st.error("Gemini预检未通过，请检查网络或模型权限")
 
-                with st.spinner("正在调用API优化提示词..."):
-                    try:
-                        if not model_name.strip():
-                            st.error("请先选择或填写模型名")
-                        elif provider == "Gemini" and not preflight_ok:
-                            st.error("Gemini预检未通过，请检查网络或模型权限")
-                        else:
+                if preflight_ok:
+                    with st.spinner("正在调用API优化提示词..."):
+                        try:
                             progress_hint.info("步骤2/2：模型生成中，请稍候...")
                             refined_prompt = refine_prompt_by_provider(
                                 provider=provider,
@@ -1190,13 +1588,12 @@ with _tabs[0]:
                                 model_name=model_name.strip(),
                                 api_base=api_base.strip(),
                             )
-
                             st.session_state["refined_prompt"] = refined_prompt
                             st.success("✅ 提示词已按你的要求优化完成")
                             progress_hint.empty()
-                    except Exception as e:
-                        progress_hint.empty()
-                        st.error(f"API调用失败：{e}")
+                        except Exception as e:
+                            progress_hint.empty()
+                            st.error(f"API调用失败：{e}")
 
         if "refined_prompt" in st.session_state:
             st.markdown("#### 📝 优化后提示词")
@@ -1227,8 +1624,6 @@ with _tabs[0]:
         zh_only_output = st.checkbox("仅输出中文", value=True, key="final_analysis_zh_only")
         run_final_btn = st.button("🧠 基于最终提示词生成分析结论", use_container_width=True, key="run_final_analysis")
         if run_final_btn:
-            run_hint = st.empty()
-            preflight_ok = True
             if not api_key.strip():
                 st.error("请先填写API Key")
             elif not model_name.strip():
@@ -1238,19 +1633,14 @@ with _tabs[0]:
             elif provider == "Gemini" and not gemini_confirm_tab1:
                 st.error("请先完成Gemini合规确认勾选")
             else:
+                run_hint = st.empty()
+                preflight_ok = True
                 if provider == "Gemini":
-                    run_hint.info("步骤1/2：Gemini连通性预检中...")
-                    ok, msg = gemini_preflight_check(api_key.strip(), model_name.strip())
-                    if not ok:
-                        preflight_ok = False
-                        st.error(msg)
-                        run_hint.empty()
-                    else:
-                        run_hint.success(msg)
+                    preflight_ok = do_gemini_preflight_with_ui(api_key.strip(), model_name.strip(), run_hint)
+                    if not preflight_ok:
+                        st.error("Gemini预检未通过，请检查网络/代理设置后重试")
 
-                if provider == "Gemini" and not preflight_ok:
-                    st.error("Gemini预检未通过，请检查网络/代理设置后重试")
-                else:
+                if preflight_ok:
                     with st.spinner("正在基于最终提示词生成分析..."):
                         try:
                             run_hint.info("步骤2/2：模型分析中，请稍候...")
@@ -1351,44 +1741,65 @@ with _tabs[1]:
     
     history_df = load_history()
     if not history_df.empty:
+        # 确保基金代码以字符串形式显示（6位无逗号）
+        history_df['基金代码'] = history_df['基金代码'].astype(str).str.zfill(6)
+
+        action_col1, action_col2 = st.columns([2, 3])
+        with action_col1:
+            if st.button("🔄 一键更新全部持仓到最新净值", use_container_width=True, key="history_refresh_positions_btn"):
+                position_path = "data/position.csv"
+                if os.path.exists(position_path):
+                    pos_df = pd.read_csv(position_path, encoding="utf-8-sig")
+                    pos_df, cnt = refresh_positions_with_latest(pos_df)
+                    pos_df.to_csv(position_path, index=False, encoding="utf-8-sig")
+                    st.success(f"✅ 持仓已更新：{cnt} 条")
+                    st.experimental_rerun()
+                else:
+                    st.warning("未找到持仓文件，请先在持仓页新增记录")
+        with action_col2:
+            st.caption("说明：会刷新最新净值、浮盈浮亏、浮盈浮亏比例、当日涨跌幅。")
+        
         # 展示历史记录表格
         st.dataframe(history_df, use_container_width=True, hide_index=True)
         st.markdown("---")
         
-        # 操作区域
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            selected_fund = st.selectbox("选择要重新分析的基金", options=history_df['基金代码'].values, format_func=lambda x: f"{x} - {history_df[history_df['基金代码']==x]['基金名称'].iloc[0]}")
-        with col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            re_analyze_btn = st.button("🔄 重新分析更新数据", use_container_width=True)
-        with col3:
-            st.markdown("<br>", unsafe_allow_html=True)
-            delete_btn = st.button("🗑️ 删除记录", use_container_width=True, type="secondary")
-        
-        # 重新分析
-        if re_analyze_btn and selected_fund:
-            st.session_state['current_fund_code'] = selected_fund
-            with st.spinner("正在重新获取数据..."):
-                analyzer = UniversalFundAnalyzer(selected_fund)
-                analysis = analyzer.get_full_analysis()
-                st.session_state['current_analysis'] = analysis
-                # 更新历史记录
-                base_info = analysis['基金基础信息']
-                save_history(
-                    fund_code=selected_fund,
-                    fund_name=base_info['基金名称'],
-                    latest_nav=base_info['最新净值'],
-                    nav_date=base_info['净值更新日期']
-                )
-                st.success("✅ 数据更新完成，已跳转到分析页面")
-                st.rerun()
-        
-        # 删除记录
-        if delete_btn and selected_fund:
-            delete_history(selected_fund)
-            st.success("✅ 记录已删除")
-            st.rerun()
+        # 操作区域：重新分析 + 删除
+        st.subheader("📋 管理分析记录")
+        for idx, row in history_df.iterrows():
+            col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 0.5])
+            fund_code = str(row['基金代码']).zfill(6)
+            fund_name = row['基金名称']
+            with col1:
+                st.write(f"**{fund_code}** - {fund_name}")
+            with col2:
+                if st.button("🔄 重新分析", key=f"reanalyze_{fund_code}_{idx}", use_container_width=True):
+                    st.session_state['current_fund_code'] = fund_code
+                    with st.spinner("正在重新获取数据..."):
+                        analyzer = UniversalFundAnalyzer(fund_code)
+                        analysis = analyzer.get_full_analysis()
+                        st.session_state['current_analysis'] = analysis
+                        # 更新历史记录
+                        base_info = analysis['基金基础信息']
+                        save_history(
+                            fund_code=fund_code,
+                            fund_name=base_info['基金名称'],
+                            latest_nav=base_info['最新净值'],
+                            nav_date=base_info['净值更新日期']
+                        )
+                        position_path = "data/position.csv"
+                        if os.path.exists(position_path):
+                            pos_df = pd.read_csv(position_path, encoding="utf-8-sig")
+                            pos_df, _ = refresh_positions_with_latest(pos_df, target_fund_code=fund_code)
+                            pos_df.to_csv(position_path, index=False, encoding="utf-8-sig")
+                        st.success("✅ 数据更新完成（历史+持仓已同步）")
+                        st.experimental_rerun()
+            with col3:
+                pass  # 占位符
+            with col4:
+                if st.button("🗑️", key=f"delete_{fund_code}_{idx}", use_container_width=True, help="删除此记录"):
+                    delete_history(fund_code)
+                    st.success("✅ 记录已删除")
+                    st.experimental_rerun()
     else:
         st.info("暂无历史分析记录，请先在「基金一键分析」页面分析基金")
 
@@ -1401,6 +1812,9 @@ with _tabs[2]:
     # 加载持仓数据
     position_path = "data/position.csv"
     position_df = pd.read_csv(position_path, encoding="utf-8-sig")
+    position_df = ensure_position_columns(position_df)
+    if not position_df.empty:
+        position_df['基金代码'] = position_df['基金代码'].astype(str).str.zfill(6)
     
     # 1. 新增持仓表单
     with st.expander("➕ 新增/修改持仓", expanded=False):
@@ -1448,7 +1862,103 @@ with _tabs[2]:
                     position_df = pd.concat([position_df, new_row], ignore_index=True)
                 position_df.to_csv(position_path, index=False, encoding="utf-8-sig")
                 st.success("✅ 持仓保存成功")
-                st.rerun()
+                st.experimental_rerun()
+
+    with st.expander("🤖 AI批量填充持仓（粘贴自然语言）", expanded=False):
+        st.caption("粘贴你的持仓描述（如微信群总结/笔记），Gemini会自动识别并生成可导入持仓。")
+        ai_text = st.text_area(
+            "粘贴持仓文本",
+            height=220,
+            placeholder="示例：国泰黄金ETF联接C(004253) 持仓成本4.3250 持仓份额545.58；华安恒生科技C(015283) 申购金额500元...",
+            key="ai_positions_raw_text",
+        )
+
+        ai_col1, ai_col2 = st.columns([2, 2])
+        with ai_col1:
+            ai_model = st.selectbox(
+                "Gemini识别模型",
+                options=["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro-latest", "gemma-3-1b-it"],
+                index=0,
+                key="ai_position_parse_model",
+            )
+        with ai_col2:
+            ai_api_key = st.text_input(
+                "Gemini API Key",
+                type="password",
+                value=get_saved_api_key("Gemini"),
+                placeholder=PROVIDER_CONFIG["Gemini"]["key_placeholder"],
+                key="ai_position_parse_api_key",
+            )
+
+        parse_btn = st.button("🧠 Gemini识别并生成预览", use_container_width=True, key="ai_parse_positions_btn")
+        if parse_btn:
+            if not ai_text.strip():
+                st.error("请先粘贴持仓文本")
+            elif not ai_api_key.strip():
+                st.error("请先填写Gemini API Key")
+            else:
+                with st.spinner("Gemini正在识别文本并结构化..."):
+                    try:
+                        as_of_date, items = parse_positions_from_text_with_gemini(
+                            raw_text=ai_text.strip(),
+                            api_key=ai_api_key.strip(),
+                            model_name=ai_model,
+                        )
+                        if not items:
+                            st.warning("未识别到可导入记录，请补充更明确的基金代码/成本/份额/申购金额。")
+                        else:
+                            st.session_state["ai_position_parse_preview"] = items
+                            st.session_state["ai_position_parse_as_of"] = as_of_date
+                            st.success(f"✅ 识别完成，共 {len(items)} 条")
+                    except Exception as e:
+                        st.error(f"识别失败：{e}")
+
+        ai_preview = st.session_state.get("ai_position_parse_preview", [])
+        if ai_preview:
+            st.markdown("#### 识别预览")
+            as_of = st.session_state.get("ai_position_parse_as_of", "")
+            if as_of:
+                st.caption(f"识别基准日期：{as_of}")
+            preview_df = pd.DataFrame(ai_preview)
+            preview_df = preview_df.rename(
+                columns={
+                    "fund_code": "基金代码",
+                    "fund_name": "基金名称",
+                    "hold_cost": "持仓成本",
+                    "hold_share": "持仓份额",
+                    "subscribe_amount": "申购金额",
+                    "buy_date": "买入日期",
+                    "notes": "备注",
+                }
+            )
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            import_mode = st.radio(
+                "导入模式",
+                options=["仅新增（同代码跳过）", "覆盖已有同代码"],
+                index=0,
+                horizontal=True,
+                key="ai_import_mode",
+            )
+
+            import_btn = st.button("✅ 写入持仓", use_container_width=True, key="ai_import_positions_btn")
+            if import_btn:
+                with st.spinner("正在写入持仓..."):
+                    try:
+                        overwrite_existing = import_mode == "覆盖已有同代码"
+                        new_df, ok_count = upsert_positions_from_ai_items(
+                            position_df,
+                            ai_preview,
+                            overwrite_existing=overwrite_existing,
+                        )
+                        if ok_count <= 0:
+                            st.warning("没有可写入的数据（可能是同代码已存在且当前模式为仅新增）。")
+                        else:
+                            new_df.to_csv(position_path, index=False, encoding="utf-8-sig")
+                            st.success(f"✅ 已写入 {ok_count} 条持仓记录")
+                            st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"写入失败：{e}")
     
     st.markdown("---")
     
@@ -1458,18 +1968,29 @@ with _tabs[2]:
         refresh_btn = st.button("🔄 刷新所有持仓最新净值", use_container_width=True)
         if refresh_btn:
             with st.spinner("正在刷新持仓数据..."):
-                for idx, row in position_df.iterrows():
-                    analyzer = UniversalFundAnalyzer(row['基金代码'])
-                    latest_nav = analyzer.history_nav['单位净值'].iloc[-1] if not analyzer.history_nav.empty else row['持仓成本']
-                    profit = (latest_nav - row['持仓成本']) * row['持仓份额']
-                    profit_rate = (latest_nav / row['持仓成本'] - 1) * 100
-                    position_df.loc[idx, ["最新净值", "浮盈浮亏", "浮盈浮亏比例"]] = [latest_nav, profit, profit_rate]
+                position_df, cnt = refresh_positions_with_latest(position_df)
                 position_df.to_csv(position_path, index=False, encoding="utf-8-sig")
-                st.success("✅ 持仓数据刷新完成")
+                st.success(f"✅ 持仓数据刷新完成（{cnt}条）")
         
         # 总盈亏计算
-        total_profit = position_df['浮盈浮亏'].sum()
-        total_profit_rate = (position_df['浮盈浮亏'].sum() / (position_df['持仓成本'] * position_df['持仓份额']).sum()) * 100 if (position_df['持仓成本'] * position_df['持仓份额']).sum() > 0 else 0
+        total_principal = 0.0
+        total_market = 0.0
+        for _idx, _row in position_df.iterrows():
+            _cost = _safe_float(_row.get('持仓成本'))
+            _share = _safe_float(_row.get('持仓份额'))
+            _sub_amt = _safe_float(_row.get('申购金额'))
+            _nav = _safe_float(_row.get('最新净值'))
+            if _share is None or _share <= 0 or _nav is None or _nav <= 0:
+                continue
+            _cost, _share, _sub_amt = _normalize_position_row_values(_cost, _share, _sub_amt, _nav)
+            _mv, _profit, _pr, _principal = _calc_profit_fields(_nav, _cost, _share, _sub_amt)
+            if _mv is not None:
+                total_market += float(_mv)
+            if _principal is not None and _principal > 0:
+                total_principal += float(_principal)
+
+        total_profit = total_market - total_principal
+        total_profit_rate = (total_profit / total_principal) * 100 if total_principal > 0 else 0
         
         # 当日/昨日盈亏判断
         now = datetime.now()
@@ -1484,17 +2005,57 @@ with _tabs[2]:
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric(profit_title, f"¥ {format_num(total_profit, 2)}", f"{format_num(total_profit_rate, 2)}%")
+            st.metric(
+                profit_title,
+                f"¥ {format_num(total_profit, 2)}",
+                f"{format_num(total_profit_rate, 2)}%",
+                delta_color="inverse",
+            )
         with col2:
-            st.metric("持仓总本金", f"¥ {format_num((position_df['持仓成本'] * position_df['持仓份额']).sum(), 2)}")
+            st.metric("持仓总本金", f"¥ {format_num(total_principal, 2)}")
         with col3:
-            st.metric("持仓总市值", f"¥ {format_num((position_df['最新净值'] * position_df['持仓份额']).sum(), 2)}")
+            st.metric("持仓总市值", f"¥ {format_num(total_market, 2)}")
         
         st.markdown("---")
         
         # 持仓明细表格
         st.subheader("📋 持仓明细")
-        st.dataframe(position_df, use_container_width=True, hide_index=True)
+        show_df = position_df.copy()
+        if "买入日期" in show_df.columns:
+            show_df["无手续费退仓时间"] = show_df["买入日期"].apply(calc_fee_free_redeem_date)
+        for col in ["浮盈浮亏比例", "当日涨跌幅"]:
+            if col in show_df.columns:
+                show_df[col] = show_df[col].apply(lambda x: f"{format_num(x, 2)}%" if pd.notna(x) else "无数据")
+        desired_order = [
+            "基金代码", "基金名称", "持仓成本", "持仓份额", "申购金额", "买入日期", "备注",
+            "最新净值", "浮盈浮亏", "浮盈浮亏比例", "当日涨跌幅", "当日涨跌日期", "无手续费退仓时间"
+        ]
+        show_order = [c for c in desired_order if c in show_df.columns] + [c for c in show_df.columns if c not in desired_order]
+        st.dataframe(show_df[show_order], use_container_width=True, hide_index=True)
+
+        st.markdown("#### 📝 手动编辑持仓明细")
+        editable_cols = [
+            "基金代码", "基金名称", "持仓成本", "持仓份额", "申购金额", "买入日期", "备注"
+        ]
+        edit_df = position_df[[c for c in editable_cols if c in position_df.columns]].copy()
+        edit_df["基金代码"] = edit_df["基金代码"].astype(str).str.zfill(6)
+
+        if hasattr(st, "data_editor"):
+            edited_df = st.data_editor(edit_df, use_container_width=True, hide_index=True, num_rows="dynamic", key="position_editor")
+        else:
+            edited_df = st.experimental_data_editor(edit_df, use_container_width=True, num_rows="dynamic", key="position_editor")
+        st.session_state["position_editor_snapshot"] = edited_df.copy()
+
+        save_edit_btn = st.button("💾 保存明细修改", use_container_width=True, key="save_position_editor_btn")
+        if save_edit_btn:
+            try:
+                merged_df = merge_position_editor_changes(position_df.copy(), edited_df)
+                merged_df, _ = refresh_positions_with_latest(merged_df)
+                merged_df.to_csv(position_path, index=False, encoding="utf-8-sig")
+                st.success("✅ 持仓明细已保存")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"保存失败：{e}")
         
         # 删除持仓
         st.markdown("---")
@@ -1510,7 +2071,7 @@ with _tabs[2]:
             position_df = position_df[position_df['基金代码'] != delete_fund]
             position_df.to_csv(position_path, index=False, encoding="utf-8-sig")
             st.success("✅ 持仓已删除")
-            st.rerun()
+            st.experimental_rerun()
     else:
         st.info("暂无持仓数据，请先新增持仓")
 
@@ -1684,8 +2245,6 @@ with _tabs[4]:
     analyze_decision_btn = st.button("🚀 生成持仓决策建议", use_container_width=True, type="primary", key="advisor_run")
 
     if analyze_decision_btn:
-        advisor_hint = st.empty()
-        preflight_ok_adv = True
         if not advisor_fund_code or len(advisor_fund_code.strip()) != 6:
             st.error("请输入有效的6位基金代码")
         elif not user_goal.strip():
@@ -1697,19 +2256,14 @@ with _tabs[4]:
         elif provider_adv == "Gemini" and not gemini_confirm_tab5:
             st.error("请先完成Gemini合规确认勾选")
         else:
+            advisor_hint = st.empty()
+            preflight_ok_adv = True
             if provider_adv == "Gemini":
-                advisor_hint.info("步骤1/3：Gemini连通性预检中...")
-                ok_adv, msg_adv = gemini_preflight_check(api_key_adv.strip(), model_adv_name.strip())
-                if not ok_adv:
-                    preflight_ok_adv = False
-                    st.error(msg_adv)
-                    advisor_hint.empty()
-                else:
-                    advisor_hint.success(msg_adv)
+                preflight_ok_adv = do_gemini_preflight_with_ui(api_key_adv.strip(), model_adv_name.strip(), advisor_hint)
+                if not preflight_ok_adv:
+                    st.error("Gemini预检未通过，请检查网络/代理设置后重试")
 
-            if provider_adv == "Gemini" and not preflight_ok_adv:
-                st.error("Gemini预检未通过，请检查网络/代理设置后重试")
-            else:
+            if preflight_ok_adv:
                 with st.spinner("正在抓取基金数据并生成个性化决策..."):
                     try:
                         advisor_hint.info("步骤2/3：正在抓取基金与持仓数据...")
