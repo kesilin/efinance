@@ -1,5 +1,4 @@
 import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import json
@@ -78,6 +77,196 @@ GEMINI_MODEL_ALIASES = {
     "gemini-3-flash": "gemini-2.0-flash",
     "gemini-3": "gemini-2.0-flash",
 }
+
+STRATEGY_PRESET_FILE = Path("data") / "strategy_presets.json"
+
+BASE_ACTION_OPTIONS = ["加仓", "减仓", "退仓", "策略"]
+BASE_RISK_OPTIONS = ["保守", "平衡", "激进"]
+BASE_ASSET_OPTIONS = ["基金为主", "股票为主", "基金+股票联动"]
+BASE_SIGNAL_OPTIONS = ["技术面优先", "基本面优先", "政策+资金面", "综合研判"]
+
+BASE_QUICK_REQUIREMENT_PHRASES = [
+    "请明确分批仓位比例，并给出每一笔的触发条件。",
+    "请把止损写成可执行规则，包含触发阈值和动作。",
+    "请给出主情景/备选情景，并评估成功概率。",
+    "请把持有周期控制在7-30天，并标注最佳执行窗口。",
+    "请增加政策与行业催化因素的影响说明。",
+    "若无法实时联网，请基于已提供资料完成策略判断。",
+]
+
+
+def _dedup_keep_order(items):
+    seen = set()
+    out = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def load_strategy_presets():
+    default_data = {
+        "action": [],
+        "risk": [],
+        "asset": [],
+        "signal": [],
+        "quick_phrases": [],
+    }
+    try:
+        if not STRATEGY_PRESET_FILE.exists():
+            return default_data
+        data = json.loads(STRATEGY_PRESET_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return default_data
+        for k in default_data.keys():
+            if not isinstance(data.get(k), list):
+                data[k] = []
+            data[k] = _dedup_keep_order(data[k])
+        return data
+    except Exception:
+        return default_data
+
+
+def save_strategy_presets(data):
+    payload = {
+        "action": _dedup_keep_order(data.get("action", [])),
+        "risk": _dedup_keep_order(data.get("risk", [])),
+        "asset": _dedup_keep_order(data.get("asset", [])),
+        "signal": _dedup_keep_order(data.get("signal", [])),
+        "quick_phrases": _dedup_keep_order(data.get("quick_phrases", [])),
+    }
+    STRATEGY_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STRATEGY_PRESET_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_strategy_preset_state():
+    if "strategy_presets" not in st.session_state:
+        st.session_state["strategy_presets"] = load_strategy_presets()
+
+
+def _get_options_with_plus(base_options, preset_key):
+    ensure_strategy_preset_state()
+    custom = st.session_state["strategy_presets"].get(preset_key, [])
+    merged = _dedup_keep_order([*base_options, *custom])
+    return [*merged, "➕ 新增自定义选项"]
+
+
+def add_custom_strategy_option(preset_key, value):
+    ensure_strategy_preset_state()
+    text = str(value or "").strip()
+    if not text:
+        return False
+    current = st.session_state["strategy_presets"].get(preset_key, [])
+    st.session_state["strategy_presets"][preset_key] = _dedup_keep_order([*current, text])
+    save_strategy_presets(st.session_state["strategy_presets"])
+    return True
+
+
+def remove_custom_strategy_options(preset_key, values):
+    ensure_strategy_preset_state()
+    current = _dedup_keep_order(st.session_state["strategy_presets"].get(preset_key, []))
+    remove_set = {str(v or "").strip() for v in (values or []) if str(v or "").strip()}
+    if not remove_set:
+        return 0
+    kept = [item for item in current if item not in remove_set]
+    removed_count = len(current) - len(kept)
+    if removed_count > 0:
+        st.session_state["strategy_presets"][preset_key] = kept
+        save_strategy_presets(st.session_state["strategy_presets"])
+    return removed_count
+
+
+def build_requirement_template(action, risk_style, asset_view, signal_focus):
+    focus = {
+        "加仓": "分批加仓",
+        "减仓": "分批减仓",
+        "退仓": "分步退仓",
+        "策略": "策略评估",
+    }.get(action, "策略评估")
+
+    risk_desc = {
+        "保守": "回撤优先，目标稳健，单笔风险控制更严格",
+        "平衡": "收益与回撤并重，分批执行，动态调整",
+        "激进": "收益优先，可接受更高波动，但必须有明确止损",
+    }.get(risk_style, "收益与回撤并重")
+
+    asset_desc = {
+        "基金为主": "以基金净值与历史波动为核心，股票信号作为辅助",
+        "股票为主": "以行业股票趋势为主，基金作为执行载体",
+        "基金+股票联动": "同时评估基金与相关股票/行业指数联动关系",
+    }.get(asset_view, "以基金与股票联动关系综合评估")
+
+    signal_desc = {
+        "技术面优先": "优先使用短中期趋势、RSI、回撤、量价节奏",
+        "基本面优先": "优先考虑行业景气、估值、盈利预期与资金面",
+        "政策+资金面": "优先考虑政策催化、事件冲击、资金流向和市场情绪",
+        "综合研判": "融合技术面、基本面、政策与资金面多维判断",
+    }.get(signal_focus, "融合多维度信号")
+
+    return (
+        f"请基于{risk_style}风格的{focus}策略，分析该标的未来7-30天操作可能性。\n"
+        f"标的视角：{asset_desc}。\n"
+        f"信号偏好：{signal_desc}。\n"
+        f"风控原则：{risk_desc}。\n"
+        "请输出：1) 是否执行当前策略；2) 关键依据（数据+策略逻辑）；"
+        "3) 分步计划（仓位、止盈、止损、时间节点）；4) 策略达成概率（高/中/低）。\n"
+        "若无法实时联网检索，请基于已提供政策/资讯材料进行判断。"
+    )
+
+
+def build_investor_snapshot(analysis):
+    """Generate compact investor-oriented status summary for quick decision making."""
+    perf = analysis.get("波段周期累计表现", {})
+    timing = analysis.get("波段择时指标", {})
+
+    p7 = perf.get("近7个交易日", {}).get("区间涨幅", "无数据")
+    p30 = perf.get("近30个交易日", {}).get("区间涨幅", "无数据")
+    dd30 = perf.get("近30个交易日", {}).get("最大回撤", "无数据")
+    rsi = timing.get("RSI(14)", "无数据")
+
+    def _fnum(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    p7f = _fnum(p7)
+    p30f = _fnum(p30)
+    dd30f = _fnum(dd30)
+    rsif = _fnum(rsi)
+
+    momentum = "震荡"
+    if p7f is not None and p30f is not None:
+        if p7f > 0 and p30f > 0:
+            momentum = "偏强"
+        elif p7f < 0 and p30f < 0:
+            momentum = "偏弱"
+
+    risk = "中"
+    if dd30f is not None:
+        if dd30f <= -8:
+            risk = "高"
+        elif dd30f >= -3:
+            risk = "低"
+
+    timing_tag = "中性"
+    if rsif is not None:
+        if rsif >= 70:
+            timing_tag = "高位"
+        elif rsif <= 30:
+            timing_tag = "低位"
+
+    return {
+        "趋势状态": momentum,
+        "短期风险": risk,
+        "择时区间": timing_tag,
+        "7日涨幅": p7,
+        "30日涨幅": p30,
+        "30日回撤": dd30,
+    }
 
 
 def _mask_key(api_key):
@@ -581,6 +770,81 @@ def refine_prompt_with_openai_compatible(base_prompt, analysis, user_requirement
     )
 
 
+def merge_user_requirement_into_prompt(base_prompt, user_requirement):
+    base = str(base_prompt or "").strip()
+    req = str(user_requirement or "").strip()
+    if not base:
+        return req
+    if not req:
+        return base
+
+    merged_req = (
+        "【我的需求（优先级最高，必须先满足）】\n"
+        f"{req}\n\n"
+        "【基础输出结构（在满足上方新增需求后继续执行）】"
+    )
+
+    if "【我的需求】" in base:
+        return base.replace("【我的需求】", merged_req, 1)
+    if "我的需求" in base:
+        return base.replace("我的需求", merged_req, 1)
+    return f"{base}\n\n{merged_req}"
+
+
+def polish_user_requirement_text(provider, api_key, model_name, api_base, user_requirement):
+    raw = str(user_requirement or "").strip()
+    if not raw:
+        return ""
+
+    polish_prompt = (
+        "你是金融分析提示词编辑器。\n"
+        "任务：把用户口语化需求改写为“可执行、可验证、结构化”的提示词需求句。\n"
+        "要求：\n"
+        "1) 只输出改写后的需求文本，不要给基金结论；\n"
+        "2) 语义不偏离原需求；\n"
+        "3) 若用户提到联网政策分析，但当前无联网检索，请改写为“基于已提供的政策/资讯材料进行分析”；\n"
+        "4) 尽量具体，包含时间范围、判断目标（持仓/减仓/继续持有）和依据维度（涨跌数据+政策因素）。\n\n"
+        f"【原始需求】\n{raw}"
+    )
+
+    try:
+        if provider == "Gemini":
+            text, _used_model = call_gemini_with_retry(polish_prompt, api_key=api_key, model_name=model_name, zh_only=True)
+        else:
+            text = call_openai_compatible_chat(
+                messages=[
+                    {"role": "system", "content": "你是提示词改写器，只输出改写后的需求文本。"},
+                    {"role": "user", "content": polish_prompt},
+                ],
+                api_key=api_key,
+                model_name=model_name,
+                api_base=api_base,
+                temperature=0.2,
+                timeout=45,
+            )
+        cleaned = re.sub(r"\n{2,}", "\n", str(text or "").strip())
+        # 防止错误地返回完整投资结论
+        if "明确结论" in cleaned and "波段操作计划" in cleaned:
+            return raw
+        return cleaned or raw
+    except Exception:
+        return raw
+
+
+def is_prompt_refine_result_valid(text):
+    src = str(text or "").strip()
+    if not src:
+        return False
+    # 必须看起来像提示词模板，而不是直接投资结论
+    has_prompt_markers = ("【我的需求" in src) or ("【核心规则" in src) or ("请你扮演" in src)
+    if not has_prompt_markers:
+        return False
+    # 避免返回成“已经分析好的结论”
+    bad_markers = ["明确结论：", "适合申购", "暂时不建议申购", "完全不建议申购", "波段操作计划："]
+    bad_count = sum(1 for b in bad_markers if b in src)
+    return bad_count < 3
+
+
 def analyze_by_final_prompt(provider, final_prompt, analysis, api_key, model_name, api_base, user_question, zh_only=False):
     terminal_log(
         "Final analysis start",
@@ -656,9 +920,22 @@ def analyze_by_final_prompt(provider, final_prompt, analysis, api_key, model_nam
 
 
 def refine_prompt_by_provider(provider, base_prompt, analysis, user_requirement, api_key, model_name, api_base):
+    polished_requirement = polish_user_requirement_text(
+        provider=provider,
+        api_key=api_key,
+        model_name=model_name,
+        api_base=api_base,
+        user_requirement=user_requirement,
+    )
+    deterministic_merged = merge_user_requirement_into_prompt(base_prompt, polished_requirement)
     full_prompt = (
-        "你是基金投研提示词优化专家。请基于给定基金数据和用户补充要求，仅输出优化后的完整提示词正文，不要解释。\n\n"
-        f"【用户补充要求】\n{user_requirement}\n\n"
+        "你是基金投研提示词优化专家。\n"
+        "任务：只允许改写‘提示词模板’，不允许给出基金分析结论。\n"
+        "输出要求：\n"
+        "1) 必须保留提示词结构（核心规则/基金核心数据/我的需求）；\n"
+        "2) 将用户补充要求改写后放入【我的需求（优先级最高，必须先满足）】；\n"
+        "3) 只输出最终提示词模板正文，不要任何解释和分析结论。\n\n"
+        f"【用户补充要求（已规范化）】\n{polished_requirement}\n\n"
         f"【原始提示词】\n{base_prompt}\n\n"
         f"【基金分析数据(JSON)】\n{json.dumps(build_analysis_payload(analysis), ensure_ascii=False)}"
     )
@@ -666,9 +943,12 @@ def refine_prompt_by_provider(provider, base_prompt, analysis, user_requirement,
     if provider == "Gemini":
         text, used_model = call_gemini_with_retry(full_prompt, api_key=api_key, model_name=model_name, zh_only=True)
         terminal_log("Prompt refine done", provider=provider, model=used_model, answer_len=len(text))
-        return text
+        if is_prompt_refine_result_valid(text):
+            return text
+        terminal_log("Prompt refine fallback", provider=provider, reason="invalid-template-output")
+        return deterministic_merged
 
-    return refine_prompt_with_openai_compatible(
+    refined = refine_prompt_with_openai_compatible(
         base_prompt=base_prompt,
         analysis=analysis,
         user_requirement=user_requirement,
@@ -676,6 +956,10 @@ def refine_prompt_by_provider(provider, base_prompt, analysis, user_requirement,
         model_name=model_name,
         api_base=api_base,
     )
+    if is_prompt_refine_result_valid(refined):
+        return refined
+    terminal_log("Prompt refine fallback", provider=provider, reason="invalid-template-output")
+    return deterministic_merged
 
 
 def run_investment_decision(provider, api_key, model_name, api_base, analysis, positions_df, user_goal, risk_style):
@@ -1013,7 +1297,7 @@ def refresh_positions_with_latest(position_df, target_fund_code=None):
 
 # ========== Streamlit页面全局配置 ==========
 st.set_page_config(
-    page_title="基金波段分析系统",
+    page_title="基金投资决策工作台",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -1136,6 +1420,52 @@ st.markdown("""
         color: #ffffff;
         text-decoration: underline;
     }
+    .investor-hero {
+        background: radial-gradient(circle at 80% 20%, rgba(89, 130, 255, 0.28), transparent 36%),
+                    linear-gradient(135deg, #1a2238 0%, #202b45 55%, #162035 100%);
+        border: 1px solid rgba(122, 161, 255, 0.45);
+        border-radius: 14px;
+        padding: 16px 18px;
+        margin-bottom: 12px;
+        box-shadow: 0 12px 26px rgba(0, 0, 0, 0.25);
+    }
+    .hero-title {
+        font-size: 1.18rem;
+        font-weight: 700;
+        color: #e7efff;
+        margin-bottom: 4px;
+    }
+    .hero-sub {
+        color: #bfd0f5;
+        font-size: 0.95rem;
+    }
+    .guide-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin: 12px 0 6px 0;
+    }
+    .guide-item {
+        background: #171f31;
+        border: 1px solid #2a3a5a;
+        border-radius: 10px;
+        padding: 10px 12px;
+    }
+    .guide-k {
+        color: #7fb3ff;
+        font-size: 0.8rem;
+        margin-bottom: 3px;
+    }
+    .guide-v {
+        color: #edf2ff;
+        font-size: 0.95rem;
+        font-weight: 600;
+    }
+    @media (max-width: 900px) {
+        .guide-grid {
+            grid-template-columns: 1fr;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1175,7 +1505,6 @@ st.sidebar.markdown(
 <a href="#prompt-final-analysis">AI最终分析</a><br>
 <a href="#history-main">历史记录</a><br>
 <a href="#position-main">持仓管理</a><br>
-<a href="#batch-main">批量对比</a><br>
 <a href="#advisor-main">智能投顾决策</a>
 </div>
     """,
@@ -1184,7 +1513,7 @@ st.sidebar.markdown(
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Gemini网络策略")
-st.sidebar.checkbox("使用系统代理", value=st.session_state.get("net_use_system_proxy", False), key="net_use_system_proxy")
+st.sidebar.checkbox("使用系统代理", value=st.session_state.get("net_use_system_proxy", True), key="net_use_system_proxy")
 st.sidebar.text_input(
     "显式代理(可选)",
     value=st.session_state.get("net_proxy_url", "http://127.0.0.1:7890"),
@@ -1197,6 +1526,7 @@ st.sidebar.number_input("连接超时(秒)", min_value=3, max_value=30, value=in
 st.sidebar.number_input("读取超时(秒)", min_value=8, max_value=120, value=int(st.session_state.get("net_read_timeout", 25)), key="net_read_timeout")
 with st.sidebar.expander("⚙️ Gemini调参", expanded=False):
     st.caption("💡 拖动滑块调整或直接输入新值")
+    st.caption("参数说明：T=随机性，P=概率覆盖范围，K=候选词数量。稳健建议 T=0.2、P=0.85-0.9、K=20-40。")
     
     # Temperature
     col1, col2 = st.columns([3.5, 1.5])
@@ -1260,12 +1590,21 @@ init_data_folder()
 ensure_memory_file()
 
 # ========== 页面标签页 ==========
-_tabs = st.tabs(["📈 基金一键分析", "📋 历史分析记录", "💰 持仓盈亏管理", "📊 批量基金对比", "🧠 智能投顾决策"])
+_tabs = st.tabs(["📈 基金一键分析", "📋 历史分析记录", "💰 持仓盈亏管理", "🧠 智能投顾决策"])
 
 # ========== 标签1：基金一键分析（核心功能） ==========
 with _tabs[0]:
     st.markdown('<div id="fund-main"></div>', unsafe_allow_html=True)
     st.title("基金7-30天波段分析系统")
+    st.markdown(
+        """
+        <div class="investor-hero">
+            <div class="hero-title">面向个人投资者的决策工作流</div>
+            <div class="hero-sub">先看数据，再优化提示词，最后执行AI结论，减少主观交易与情绪化决策。</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown("---")
     
     # 输入区域
@@ -1333,6 +1672,23 @@ with _tabs[0]:
             st.metric("基金类型", base_info['基金类型'])
         with col4:
             st.metric("净值更新日期", base_info['净值更新日期'])
+
+        snapshot = build_investor_snapshot(analysis)
+        st.markdown(
+            f"""
+            <div class="guide-grid">
+                <div class="guide-item"><div class="guide-k">趋势状态</div><div class="guide-v">{snapshot['趋势状态']}</div></div>
+                <div class="guide-item"><div class="guide-k">短期风险</div><div class="guide-v">{snapshot['短期风险']}</div></div>
+                <div class="guide-item"><div class="guide-k">择时区间</div><div class="guide-v">{snapshot['择时区间']}</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"投资者快照：近7日 {format_num(snapshot['7日涨幅'], 2)}%，"
+            f"近30日 {format_num(snapshot['30日涨幅'], 2)}%，"
+            f"近30日最大回撤 {format_num(snapshot['30日回撤'], 2)}%。"
+        )
         
         st.markdown("---")
 
@@ -1476,6 +1832,7 @@ with _tabs[0]:
         st.markdown('<div id="prompt-opt"></div>', unsafe_allow_html=True)
         st.subheader("🧠 API二次改写提示词（按你的额外要求自动优化）")
         st.caption("支持 Gemini / DeepSeek / 豆包。选择渠道后，模型列表会自动切换。")
+        st.info("提示：这里的功能是“改写提示词模板”，不是直接做基金结论分析。")
 
         provider = st.selectbox("选择API渠道", list(PROVIDER_CONFIG.keys()), index=0)
         provider_meta = PROVIDER_CONFIG[provider]
@@ -1515,6 +1872,7 @@ with _tabs[0]:
 
         if provider == "Gemini":
             with st.expander("Gemini跨网与合规检测", expanded=False):
+                st.caption("当前应用调用的是 Gemini 生成接口，本身不带网页浏览工具；实时信息主要来自你本地抓取的数据源。")
                 if st.button("检测当前网络状态", key="gemini_check_btn_tab1"):
                     session = build_http_session(
                         st.session_state.get("net_proxy_url", "").strip(),
@@ -1553,10 +1911,131 @@ with _tabs[0]:
         else:
             gemini_confirm_tab1 = True
 
+        if "user_requirement_tab1" not in st.session_state:
+            st.session_state["user_requirement_tab1"] = ""
+
+        st.markdown("#### 🧩 快速生成策略要求")
+        st.caption("保留点选生成能力；你可在每个下拉框最后选择“新增自定义选项”并保存，后续会自动记住。")
+
+        action_options = _get_options_with_plus(BASE_ACTION_OPTIONS, "action")
+        risk_options = _get_options_with_plus(BASE_RISK_OPTIONS, "risk")
+        asset_options = _get_options_with_plus(BASE_ASSET_OPTIONS, "asset")
+        signal_options = _get_options_with_plus(BASE_SIGNAL_OPTIONS, "signal")
+
+        maker_col1, maker_col2 = st.columns(2)
+        with maker_col1:
+            action_choice = st.selectbox("操作方向", action_options, key="req_action_tab1")
+            risk_choice = st.selectbox("策略风格", risk_options, key="req_risk_tab1")
+        with maker_col2:
+            asset_choice = st.selectbox("标的视角", asset_options, key="req_asset_tab1")
+            signal_choice = st.selectbox("信号侧重", signal_options, key="req_signal_tab1")
+
+        plus_map = [
+            ("action", "操作方向", action_choice, "new_action_text_tab1", "save_new_action_tab1"),
+            ("risk", "策略风格", risk_choice, "new_risk_text_tab1", "save_new_risk_tab1"),
+            ("asset", "标的视角", asset_choice, "new_asset_text_tab1", "save_new_asset_tab1"),
+            ("signal", "信号侧重", signal_choice, "new_signal_text_tab1", "save_new_signal_tab1"),
+        ]
+        for preset_key, title, selected, input_key, btn_key in plus_map:
+            if selected == "➕ 新增自定义选项":
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    new_text = st.text_input(f"新增{title}", key=input_key, placeholder=f"输入要新增的{title}")
+                with c2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("保存", key=btn_key, use_container_width=True):
+                        if add_custom_strategy_option(preset_key, new_text):
+                            st.success(f"已保存：{new_text.strip()}")
+                            st.experimental_rerun()
+                        else:
+                            st.warning("请输入有效内容后再保存")
+
+        effective_action = action_choice if action_choice != "➕ 新增自定义选项" else BASE_ACTION_OPTIONS[0]
+        effective_risk = risk_choice if risk_choice != "➕ 新增自定义选项" else BASE_RISK_OPTIONS[0]
+        effective_asset = asset_choice if asset_choice != "➕ 新增自定义选项" else BASE_ASSET_OPTIONS[0]
+        effective_signal = signal_choice if signal_choice != "➕ 新增自定义选项" else BASE_SIGNAL_OPTIONS[0]
+
+        if st.button("🪄 生成策略需求草稿", use_container_width=True, key="gen_req_template_tab1"):
+            st.session_state["user_requirement_tab1"] = build_requirement_template(
+                action=effective_action,
+                risk_style=effective_risk,
+                asset_view=effective_asset,
+                signal_focus=effective_signal,
+            )
+
+        st.markdown("##### 快捷补充语句")
+        ensure_strategy_preset_state()
+        quick_phrases = _dedup_keep_order([
+            *BASE_QUICK_REQUIREMENT_PHRASES,
+            *st.session_state["strategy_presets"].get("quick_phrases", []),
+        ])
+        phrase_cols = st.columns(3)
+        for idx, phrase in enumerate(quick_phrases):
+            with phrase_cols[idx % 3]:
+                if st.button(f"➕ 语句{idx+1}", key=f"quick_phrase_{idx}_tab1", use_container_width=True):
+                    current = st.session_state.get("user_requirement_tab1", "").strip()
+                    st.session_state["user_requirement_tab1"] = f"{current}\n{phrase}".strip() if current else phrase
+
+        q1, q2 = st.columns([4, 1])
+        with q1:
+            custom_phrase = st.text_input("新增快捷语句", key="new_quick_phrase_tab1", placeholder="输入后保存，下次可直接点选")
+        with q2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("保存语句", key="save_new_quick_phrase_tab1", use_container_width=True):
+                if add_custom_strategy_option("quick_phrases", custom_phrase):
+                    st.success("快捷语句已保存")
+                    st.experimental_rerun()
+                else:
+                    st.warning("请输入有效语句后再保存")
+
+        with st.expander("🗂 管理已保存快捷语句", expanded=False):
+            ensure_strategy_preset_state()
+            saved_phrases = st.session_state["strategy_presets"].get("quick_phrases", [])
+            if saved_phrases:
+                st.caption("可删除你自己保存的快捷语句（内置语句不会出现在这里）。")
+                del_targets = st.multiselect(
+                    "选择要删除的语句",
+                    options=saved_phrases,
+                    key="delete_quick_phrase_targets_tab1",
+                )
+                if st.button("🗑 删除选中语句", key="delete_quick_phrase_btn_tab1", use_container_width=True):
+                    removed = remove_custom_strategy_options("quick_phrases", del_targets)
+                    if removed > 0:
+                        st.success(f"已删除 {removed} 条快捷语句")
+                        st.experimental_rerun()
+                    else:
+                        st.warning("请先选择要删除的语句")
+            else:
+                st.caption("你还没有保存自定义快捷语句。")
+
+            st.markdown("##### 批量新增")
+            batch_text = st.text_area(
+                "每行一条语句",
+                key="batch_new_quick_phrase_tab1",
+                placeholder="示例：\n请明确分批仓位比例。\n请给出执行概率与备选情景。",
+                height=90,
+            )
+            if st.button("📥 批量保存语句", key="batch_save_quick_phrase_btn_tab1", use_container_width=True):
+                lines = [line.strip() for line in str(batch_text or "").splitlines() if line.strip()]
+                added = 0
+                for line in lines:
+                    if add_custom_strategy_option("quick_phrases", line):
+                        added += 1
+                if added > 0:
+                    st.success(f"已保存 {added} 条语句")
+                    st.experimental_rerun()
+                else:
+                    st.warning("没有可保存的新语句")
+
         user_requirement = st.text_area(
-            "补充你的策略要求（例如：更激进/更保守、强调止损、加入仓位分批规则等）",
-            placeholder="示例：请把策略改成偏保守，回撤控制在3%以内，给出分批建仓比例和明确止盈止损触发条件。",
-            height=110,
+            "补充你的策略要求",
+            key="user_requirement_tab1",
+            placeholder=(
+                "示例：请按保守策略分析未来7-30天波段机会，"
+                "回撤控制在3%以内，给出分批仓位、止盈止损和执行概率；"
+                "若无法实时联网，请基于已提供的政策/资讯材料判断。"
+            ),
+            height=170,
         )
 
         refine_btn = st.button("✨ 调用API改写提示词", use_container_width=True)
@@ -1583,7 +2062,7 @@ with _tabs[0]:
                                 provider=provider,
                                 base_prompt=gemini_prompt,
                                 analysis=analysis,
-                                user_requirement=user_requirement,
+                                user_requirement=st.session_state.get("user_requirement_tab1", ""),
                                 api_key=api_key.strip(),
                                 model_name=model_name.strip(),
                                 api_base=api_base.strip(),
@@ -1614,13 +2093,8 @@ with _tabs[0]:
             st.caption("当前使用：优化后提示词")
         else:
             st.caption("当前使用：原始提示词（未二次优化）")
-
-        analysis_question = st.text_area(
-            "你希望模型回答的问题",
-            placeholder="示例：结合当前持仓和这只基金近30天表现，给出未来10个交易日的抄底/减仓/观望计划。",
-            height=90,
-            key="final_analysis_question",
-        )
+        st.info("本模块将直接按“最新版本提示词”执行分析，不再需要额外问题输入。")
+        analysis_question = "请严格按最终提示词模板输出完整分析结论，并给出可执行的波段操作建议。"
         zh_only_output = st.checkbox("仅输出中文", value=True, key="final_analysis_zh_only")
         run_final_btn = st.button("🧠 基于最终提示词生成分析结论", use_container_width=True, key="run_final_analysis")
         if run_final_btn:
@@ -1628,8 +2102,6 @@ with _tabs[0]:
                 st.error("请先填写API Key")
             elif not model_name.strip():
                 st.error("请先选择或填写模型名")
-            elif not analysis_question.strip():
-                st.error("请先输入你的问题")
             elif provider == "Gemini" and not gemini_confirm_tab1:
                 st.error("请先完成Gemini合规确认勾选")
             else:
@@ -1651,7 +2123,7 @@ with _tabs[0]:
                                 api_key=api_key.strip(),
                                 model_name=model_name.strip(),
                                 api_base=api_base.strip(),
-                                user_question=analysis_question.strip(),
+                                user_question=analysis_question,
                                 zh_only=zh_only_output,
                             )
                             st.session_state["final_prompt_result"] = final_result
@@ -2075,74 +2547,8 @@ with _tabs[2]:
     else:
         st.info("暂无持仓数据，请先新增持仓")
 
-# ========== 标签4：批量基金对比 ==========
+# ========== 标签4：智能投顾决策（记忆增强） ==========
 with _tabs[3]:
-    st.markdown('<div id="batch-main"></div>', unsafe_allow_html=True)
-    st.title("批量基金对比分析")
-    st.markdown("---")
-    
-    # 多基金输入
-    fund_codes = st.text_area("请输入要对比的基金代码，每行一个", placeholder="例如：\n020671\n025209\n562500", height=150)
-    compare_btn = st.button("📊 开始批量对比", use_container_width=True, type="primary")
-    
-    if compare_btn and fund_codes:
-        fund_list = [code.strip() for code in fund_codes.split("\n") if code.strip() and len(code.strip())==6]
-        if len(fund_list) == 0:
-            st.error("请输入有效的6位基金代码")
-        else:
-            compare_result = []
-            with st.spinner(f"正在获取{len(fund_list)}只基金数据，对比分析中..."):
-                for code in fund_list:
-                    try:
-                        analyzer = UniversalFundAnalyzer(code)
-                        analysis = analyzer.get_full_analysis()
-                        base_info = analysis['基金基础信息']
-                        perf_30d = analysis['波段周期累计表现']['近30个交易日']['区间涨幅']
-                        perf_7d = analysis['波段周期累计表现']['近7个交易日']['区间涨幅']
-                        max_drawdown = analysis['波段周期累计表现']['近30个交易日']['最大回撤']
-                        
-                        compare_result.append({
-                            "基金代码": code,
-                            "基金名称": base_info['基金名称'],
-                            "最新净值": base_info['最新净值'],
-                            "近7天涨幅(%)": format_num(perf_7d, 2),
-                            "近30天涨幅(%)": format_num(perf_30d, 2),
-                            "近30天最大回撤(%)": format_num(max_drawdown, 2),
-                            "净值更新日期": base_info['净值更新日期']
-                        })
-                        # 保存到历史记录
-                        save_history(code, base_info['基金名称'], base_info['最新净值'], base_info['净值更新日期'])
-                    except Exception as e:
-                        st.warning(f"基金{code}数据获取失败：{e}")
-                        continue
-                
-                # 展示对比结果
-                if compare_result:
-                    compare_df = pd.DataFrame(compare_result)
-                    st.dataframe(compare_df, use_container_width=True, hide_index=True)
-                    
-                    # 可视化对比
-                    st.subheader("📈 近30天涨幅对比")
-                    fig = px.bar(
-                        compare_df,
-                        x="基金名称",
-                        y="近30天涨幅(%)",
-                        color="近30天涨幅(%)",
-                        color_continuous_scale=["#FF4B4B", "#00FF94"],
-                        title="近30天涨幅对比"
-                    )
-                    fig.update_layout(
-                        plot_bgcolor="#1E2130",
-                        paper_bgcolor="#0E1117",
-                        font=dict(color="#FAFAFA"),
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-
-                    
-
-# ========== 标签5：智能投顾决策（记忆增强） ==========
-with _tabs[4]:
     st.markdown('<div id="advisor-main"></div>', unsafe_allow_html=True)
     st.title("智能投顾决策中心")
     st.markdown("---")
