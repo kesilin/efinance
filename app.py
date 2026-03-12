@@ -1719,26 +1719,47 @@ with _tabs[0]:
         
         # 2. 可视化曲线
         st.subheader("📈 净值走势与涨跌统计")
+        curve_range_map = {
+            "近30天": 30,
+            "近3个月": 90,
+            "近半年": 180,
+        }
+        selected_curve_range = st.selectbox(
+            "曲线区间",
+            options=list(curve_range_map.keys()),
+            index=0,
+            key="tab1_curve_range",
+            help="默认近30天，可切换近3个月或近半年。",
+        )
         col1, col2 = st.columns([2, 1])
         
-        # 近30天净值曲线
+        # 可选区间净值曲线
         with col1:
             if not history_nav.empty:
-                df_30d = history_nav.tail(30).copy()
+                lookback_days = curve_range_map[selected_curve_range]
+                latest_date = pd.to_datetime(history_nav['日期']).max()
+                start_date = latest_date - pd.Timedelta(days=lookback_days)
+                df_curve = history_nav[history_nav['日期'] >= start_date].copy()
+                if len(df_curve) < 2:
+                    df_curve = history_nav.tail(min(30, len(history_nav))).copy()
+
                 # 计算累计涨幅，判断颜色
-                total_change_30d = (df_30d['单位净值'].iloc[-1] / df_30d['单位净值'].iloc[0] - 1) * 100
-                line_color = "#00FF94" if total_change_30d >= 0 else "#FF4B4B"
+                if len(df_curve) >= 2:
+                    total_change_curve = (df_curve['单位净值'].iloc[-1] / df_curve['单位净值'].iloc[0] - 1) * 100
+                else:
+                    total_change_curve = 0
+                line_color = "#00FF94" if total_change_curve >= 0 else "#FF4B4B"
                 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
-                    x=df_30d['日期'],
-                    y=df_30d['单位净值'],
+                    x=df_curve['日期'],
+                    y=df_curve['单位净值'],
                     mode='lines',
                     line=dict(color=line_color, width=3),
                     name='单位净值'
                 ))
                 fig.update_layout(
-                    title="近30天净值走势",
+                    title=f"{selected_curve_range}净值走势（{len(df_curve)}个交易日）",
                     plot_bgcolor="#1E2130",
                     paper_bgcolor="#0E1117",
                     font=dict(color="#FAFAFA"),
@@ -1747,6 +1768,10 @@ with _tabs[0]:
                     hovermode="x unified"
                 )
                 st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    f"当前区间：{df_curve['日期'].min().strftime('%Y-%m-%d')} 至 "
+                    f"{df_curve['日期'].max().strftime('%Y-%m-%d')}，累计涨跌 {format_num(total_change_curve, 2)}%"
+                )
         
         # 近7天涨跌柱状图
         with col2:
